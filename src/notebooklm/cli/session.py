@@ -667,3 +667,190 @@ def register_session_commands(cli):
             console.print(
                 "\n[yellow]Cookies may be expired. Run 'notebooklm login' to refresh.[/yellow]"
             )
+
+    @auth_group.command("import-chrome")
+    @click.option(
+        "--profile",
+        default="Default",
+        show_default=True,
+        help="Chrome profile directory name under the Chrome root.",
+    )
+    @click.option(
+        "--chrome-root",
+        type=click.Path(),
+        default=None,
+        help=(
+            "Base directory containing Chrome profiles. "
+            "Defaults to ~/Library/Application Support/Google/Chrome on macOS."
+        ),
+    )
+    @click.option(
+        "--output",
+        type=click.Path(),
+        default=None,
+        help="Output path for storage_state.json (default: $NOTEBOOKLM_HOME/storage_state.json).",
+    )
+    def auth_import_chrome(profile, chrome_root, output):
+        """Import auth cookies from a local Chrome profile (macOS only).
+
+        Reads Google auth cookies from your real Chrome browser, decrypts them
+        using the macOS Keychain, and saves them as storage_state.json so that
+        you don't need to use the Playwright browser login flow.
+
+        \b
+        Requirements:
+          pip install notebooklm[chrome]   # adds the cryptography package
+
+        \b
+        Examples:
+          notebooklm auth import-chrome
+          notebooklm auth import-chrome --profile "Profile 1"
+          notebooklm auth import-chrome --test   # check afterwards
+        """
+        import hashlib
+        import shutil
+        import sqlite3
+        import subprocess
+        import tempfile
+
+        from ..auth import _is_allowed_auth_domain
+
+        # --- helpers -----------------------------------------------------------
+
+        MACOS_CHROME_ROOT = Path.home() / "Library/Application Support/Google/Chrome"
+        SAFE_STORAGE_SERVICES = ("Chrome Safe Storage", "Google Chrome Safe Storage")
+
+        def _get_cookie_db(profile_dir: Path) -> Path:
+            for candidate in (profile_dir / "Network" / "Cookies", profile_dir / "Cookies"):
+                if candidate.exists():
+                    return candidate
+            raise FileNotFoundError(
+                f"Chrome cookie database not found under {profile_dir}.\n"
+                "Make sure Chrome is installed and the profile exists."
+            )
+
+        def _get_safe_storage_secret() -> str:
+            for service in SAFE_STORAGE_SERVICES:
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-w", "-s", service],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip()
+            raise RuntimeError(
+                "Could not read Chrome Safe Storage secret from macOS Keychain.\n"
+                "Open Keychain Access and confirm the 'Chrome Safe Storage' item exists."
+            )
+
+        def _chrome_epoch_to_unix(expires_utc: int) -> int:
+            if not expires_utc:
+                return -1
+            unix_seconds = int(expires_utc / 1_000_000 - 11_644_473_600)
+            return unix_seconds if unix_seconds > 0 else -1
+
+        def _decrypt(encrypted_value: bytes, secret: str, host_key: str = "") -> str:
+            if not encrypted_value:
+                return ""
+            if encrypted_value.startswith((b"v10", b"v11")):
+                try:
+                    from cryptography.hazmat.backends import default_backend
+                    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "The 'cryptography' package is required to decrypt Chrome cookies.\n"
+                        "Install it with:  pip install notebooklm[chrome]"
+                    ) from exc
+                key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
+                cipher = Cipher(
+                    algorithms.AES(key),
+                    modes.CBC(b" " * 16),
+                    backend=default_backend(),
+                )
+                dec = cipher.decryptor()
+                payload = dec.update(encrypted_value[3:]) + dec.finalize()
+                pad = payload[-1]
+                decrypted = payload[:-pad]
+                digest = hashlib.sha256(host_key.encode()).digest() if host_key else None
+                if digest and decrypted.startswith(digest):
+                    decrypted = decrypted[len(digest) :]
+                return decrypted.decode("utf-8")
+            return encrypted_value.decode("utf-8")
+
+        def _load_rows(db_path: Path) -> list[dict]:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_db = Path(tmp) / "Cookies"
+                shutil.copy2(db_path, tmp_db)
+                conn = sqlite3.connect(tmp_db)
+                conn.row_factory = sqlite3.Row
+                try:
+                    rows = conn.execute(
+                        "SELECT host_key, name, value, encrypted_value, path,"
+                        " expires_utc, is_secure, is_httponly FROM cookies"
+                    ).fetchall()
+                finally:
+                    conn.close()
+            return [dict(r) for r in rows]
+
+        # --- main logic --------------------------------------------------------
+
+        if sys.platform != "darwin":
+            console.print("[red]Error:[/red] 'auth import-chrome' is only supported on macOS.")
+            raise SystemExit(1)
+
+        chrome_root_path = Path(chrome_root).expanduser() if chrome_root else MACOS_CHROME_ROOT
+        profile_dir = chrome_root_path / profile
+        output_path = Path(output).expanduser() if output else get_storage_path()
+
+        console.print(f"[dim]Chrome profile: {profile_dir}[/dim]")
+        console.print(f"[dim]Output: {output_path}[/dim]")
+
+        try:
+            db_path = _get_cookie_db(profile_dir)
+            secret = _get_safe_storage_secret()
+        except (FileNotFoundError, RuntimeError) as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise SystemExit(1) from None
+
+        selected: list[dict] = []
+        for row in _load_rows(db_path):
+            domain = str(row.get("host_key") or "")
+            if not _is_allowed_auth_domain(domain):
+                continue
+            value = str(row.get("value") or "")
+            if not value:
+                try:
+                    value = _decrypt(bytes(row.get("encrypted_value") or b""), secret, domain)
+                except RuntimeError as e:
+                    console.print(f"[red]Error:[/red] {e}")
+                    raise SystemExit(1) from None
+            if not value:
+                continue
+            selected.append(
+                {
+                    "name": row["name"],
+                    "value": value,
+                    "domain": domain,
+                    "path": row.get("path") or "/",
+                    "expires": _chrome_epoch_to_unix(int(row.get("expires_utc") or 0)),
+                    "httpOnly": bool(row.get("is_httponly")),
+                    "secure": bool(row.get("is_secure")),
+                }
+            )
+
+        if not selected:
+            console.print(
+                "[red]Error:[/red] No Google auth cookies found in the Chrome profile.\n"
+                "Make sure you are signed in to Google in that profile."
+            )
+            raise SystemExit(1)
+
+        storage_state = {"cookies": selected}
+        output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        output_path.write_text(json.dumps(storage_state, indent=2), encoding="utf-8")
+        output_path.chmod(0o600)
+
+        console.print(f"[green]Exported {len(selected)} cookies to:[/green] {output_path}")
+        console.print("[dim]Run 'notebooklm auth check --test' to verify.[/dim]")
+
+        _sync_server_language_to_config()

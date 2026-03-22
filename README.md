@@ -17,9 +17,11 @@
 git clone https://github.com/petrpopov/notebooklm-py.git
 cd notebooklm-py
 
-# Установите пакет с зависимостью для дешифровки cookies
-pip install '.[chrome]'
+# Установите пакет в editable-режиме с зависимостями для Chrome cookies
+pip install -e '.[chrome]'
 ```
+
+> **Примечание:** флаг `-e` (editable) нужен, чтобы изменения в исходниках подхватывались без переустановки.
 
 ---
 

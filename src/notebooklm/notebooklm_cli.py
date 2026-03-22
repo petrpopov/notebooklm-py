@@ -151,7 +151,68 @@ cli.add_command(language)
 # =============================================================================
 
 
+def _detect_macos_system_proxy():
+    """Detect macOS system proxy via scutil and set env vars for httpx.
+
+    Only sets env vars that are not already defined, so explicit user
+    configuration always takes precedence.
+    """
+    if sys.platform != "darwin":
+        return
+
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["scutil", "--proxy"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return
+
+        output = result.stdout
+        # Parse SOCKS proxy
+        if "SOCKSEnable : 1" in output:
+            host, port = None, None
+            for line in output.splitlines():
+                if "SOCKSProxy :" in line:
+                    host = line.split(":")[-1].strip()
+                elif "SOCKSPort :" in line:
+                    port = line.split(":")[-1].strip()
+            if host and port:
+                os.environ.setdefault("ALL_PROXY", f"socks5://{host}:{port}")
+
+        # Parse HTTP proxy
+        if "HTTPEnable : 1" in output:
+            host, port = None, None
+            for line in output.splitlines():
+                if "HTTPProxy :" in line:
+                    host = line.split(":")[-1].strip()
+                elif "HTTPPort :" in line:
+                    port = line.split(":")[-1].strip()
+            if host and port:
+                os.environ.setdefault("HTTP_PROXY", f"http://{host}:{port}")
+                os.environ.setdefault("http_proxy", f"http://{host}:{port}")
+
+        # Parse HTTPS proxy
+        if "HTTPSEnable : 1" in output:
+            host, port = None, None
+            for line in output.splitlines():
+                if "HTTPSProxy :" in line:
+                    host = line.split(":")[-1].strip()
+                elif "HTTPSPort :" in line:
+                    port = line.split(":")[-1].strip()
+            if host and port:
+                os.environ.setdefault("HTTPS_PROXY", f"https://{host}:{port}")
+                os.environ.setdefault("https_proxy", f"https://{host}:{port}")
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+
 def main():
+    # Detect macOS system proxy and set env vars for httpx
+    _detect_macos_system_proxy()
+
     # Windows-specific fixes
     if sys.platform == "win32":
         # Force UTF-8 encoding for Unicode output on non-English Windows systems

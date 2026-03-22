@@ -5,6 +5,8 @@
 > Основная цель форка — обойти проблему с `notebooklm login`, который запускает браузер в изолированном окружении Playwright, где не работают кнопки входа Google SSO.
 >
 > **Решение:** импортируйте cookies напрямую из вашего основного профиля Chrome без открытия браузера.
+>
+> Также добавлена поддержка **SOCKS5 proxy** — httpx автоматически использует системные proxy из переменных окружения (`ALL_PROXY`, `HTTPS_PROXY`).
 
 ---
 
@@ -44,6 +46,23 @@ notebooklm use <notebook_id>
 notebooklm ask "What are the key themes?"
 notebooklm generate audio "make it engaging" --wait
 ```
+
+---
+
+## Работа через proxy (SOCKS5/HTTP)
+
+Если вы используете VPN/proxy (например, Xray, V2Ray), httpx автоматически подхватывает настройки из переменных окружения:
+
+```bash
+# Переменные уже установлены в вашем shell (например, через xray-start.sh)
+export ALL_PROXY=socks5://127.0.0.1:10808
+export HTTPS_PROXY=http://127.0.0.1:10809
+
+# Все команды автоматически используют proxy
+notebooklm list
+```
+
+Зависимость `httpx[socks]` (пакет `socksio`) уже включена — SOCKS5 proxy работает из коробки.
 
 ---
 
